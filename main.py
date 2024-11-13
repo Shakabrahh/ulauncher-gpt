@@ -1,183 +1,270 @@
+import json
 import logging
-from ulauncher.api.client.Extension import Extension
+from collections.abc import Iterator
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
+
+import requests
 from ulauncher.api.client.EventListener import EventListener
-from ulauncher.api.shared.event import KeywordQueryEvent
-from ulauncher.api.shared.item.ExtensionResultItem import ExtensionResultItem
-from ulauncher.api.shared.action.RenderResultListAction import RenderResultListAction
+from ulauncher.api.client.Extension import Extension
 from ulauncher.api.shared.action.CopyToClipboardAction import CopyToClipboardAction
 from ulauncher.api.shared.action.DoNothingAction import DoNothingAction
-import requests
-import json
+from ulauncher.api.shared.action.HideWindowAction import HideWindowAction
+from ulauncher.api.shared.action.RenderResultListAction import RenderResultListAction
+from ulauncher.api.shared.event import ItemEnterEvent, KeywordQueryEvent
+from ulauncher.api.shared.item.ExtensionResultItem import ExtensionResultItem
 
 logger = logging.getLogger(__name__)
-EXTENSION_ICON = 'images/icon.png'
+EXTENSION_ICON = "images/icon.png"
+CHUNK_ACCUMULATION_SIZE = 50
+MAX_NAME_LENGTH = 50
+MAX_DESCRIPTION_LENGTH = 200
 
 
-def wrap_text(text, max_w):
+class ChatGPTError(Exception):
+    """Base exception for ChatGPT extension errors."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class ChatGPTConfig:
+    """Configuration for ChatGPT API calls."""
+
+    api_key: str
+    api_endpoint: str
+    max_tokens: int
+    frequency_penalty: float
+    presence_penalty: float
+    temperature: float
+    top_p: float
+    system_prompt: str
+    line_wrap: int
+    model: str
+
+    @classmethod
+    def from_preferences(cls, preferences: dict[str, Any]) -> "ChatGPTConfig":
+        """Create config from extension preferences."""
+        try:
+            return cls(
+                api_key=str(preferences["api_key"]),
+                api_endpoint=str(
+                    preferences.get(
+                        "api_endpoint", "https://api.openai.com/v1/chat/completions"
+                    )
+                ),
+                max_tokens=int(preferences.get("max_tokens", 150)),
+                frequency_penalty=float(preferences.get("frequency_penalty", 0.0)),
+                presence_penalty=float(preferences.get("presence_penalty", 0.0)),
+                temperature=float(preferences.get("temperature", 0.7)),
+                top_p=float(preferences.get("top_p", 1.0)),
+                system_prompt=str(preferences.get("system_prompt", "")),
+                line_wrap=int(preferences.get("line_wrap", 64)),
+                model=str(preferences.get("model", "gpt-4o")),
+            )
+        except (KeyError, ValueError) as e:
+            raise ChatGPTError(f"Invalid preferences: {str(e)}") from e
+
+    @property
+    def api_headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+    @property
+    def base_payload(self) -> dict:
+        return {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "stream": True,
+        }
+
+
+def sanitize_text(text: str) -> str:
+    """Clean and format command output for display."""
+    # Preserve escaped newlines and other special characters
+    text = text.strip("`").strip()
+    # Only remove unescaped newlines
+    text = " ".join(line.strip() for line in text.splitlines())
+    return text
+
+
+@lru_cache(maxsize=100)
+def wrap_text(text: str, max_width: int) -> str:
+    """Wrap text to specified width, with caching for performance."""
+    if not text:
+        return text
+
     words = text.split()
     lines = []
-    current_line = ''
+    current_line = []
+    current_length = 0
+
     for word in words:
-        if len(current_line + word) <= max_w:
-            current_line += ' ' + word
+        word_length = len(word)
+        if current_length + word_length + 1 <= max_width:
+            current_line.append(word)
+            current_length += word_length + 1
         else:
-            lines.append(current_line.strip())
-            current_line = word
-    lines.append(current_line.strip())
-    return '\n'.join(lines)
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [word]
+            current_length = word_length + 1
 
+    if current_line:
+        lines.append(" ".join(current_line))
 
-class GPTExtension(Extension):
-    """
-    Ulauncher extension to generate text using GPT-3
-    """
-
-    def __init__(self):
-        super(GPTExtension, self).__init__()
-        logger.info('GPT-3 extension started')
-        self.subscribe(KeywordQueryEvent, KeywordQueryEventListener())
+    return "\n".join(lines)
 
 
 class KeywordQueryEventListener(EventListener):
-    """
-    Event listener for KeywordQueryEvent
-    """
+    def _create_result_item(
+        self, text: str, config: ChatGPTConfig
+    ) -> ExtensionResultItem:
+        """Create a result item with clean, formatted text."""
+        clean_text = sanitize_text(text)
 
-    def on_event(self, event, extension):
-        endpoint = "https://api.openai.com/v1/chat/completions"
+        # For display, we'll show a preview
+        display_text = clean_text[:MAX_DESCRIPTION_LENGTH]
+        if len(clean_text) > MAX_DESCRIPTION_LENGTH:
+            display_text += "..."
 
-        logger.info('Processing user preferences')
-        # Get user preferences
-        try:
-            api_key = extension.preferences['api_key']
-            max_tokens = int(extension.preferences['max_tokens'])
-            frequency_penalty = float(
-                extension.preferences['frequency_penalty'])
-            presence_penalty = float(extension.preferences['presence_penalty'])
-            temperature = float(extension.preferences['temperature'])
-            top_p = float(extension.preferences['top_p'])
-            system_prompt = extension.preferences['system_prompt']
-            line_wrap = int(extension.preferences['line_wrap'])
-            model = extension.preferences['model']
-        # pylint: disable=broad-except
-        except Exception as err:
-            logger.error('Failed to parse preferences: %s', str(err))
-            return RenderResultListAction([
-                ExtensionResultItem(icon=EXTENSION_ICON,
-                                    name='Failed to parse preferences: ' +
-                                    str(err),
-                                    on_enter=CopyToClipboardAction(str(err)))
-            ])
+        return ExtensionResultItem(
+            icon=EXTENSION_ICON,
+            name=(
+                display_text[:MAX_NAME_LENGTH] + "..."
+                if len(display_text) > MAX_NAME_LENGTH
+                else display_text
+            ),
+            description=display_text,
+            on_enter=CopyToClipboardAction(clean_text),  # Full text for clipboard
+        )
 
-        # Get search term
-        search_term = event.get_argument()
-        logger.info('The search term is: %s', search_term)
-        # Display blank prompt if user hasn't typed anything
-        if not search_term:
-            logger.info('Displaying blank prompt')
-            return RenderResultListAction([
-                ExtensionResultItem(icon=EXTENSION_ICON,
-                                    name='Type in a prompt...',
-                                    on_enter=DoNothingAction())
-            ])
-
-        # Create POST request
-        headers = {
-            'content-type': 'application/json',
-            'Authorization': 'Bearer ' + api_key
-        }
-
-        body = {
+    def _stream_api_request(self, config: ChatGPTConfig, prompt: str) -> Iterator[str]:
+        payload = {
+            **config.base_payload,
             "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": search_term
-                }
+                {"role": "system", "content": config.system_prompt},
+                {"role": "user", "content": prompt},
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-            "frequency_penalty": frequency_penalty,
-            "presence_penalty": presence_penalty,
-            "model": model,
         }
-        body = json.dumps(body)
-
-        logger.info('Request body: %s', str(body))
-        logger.info('Request headers: %s', str(headers))
-
-        # Send POST request
-        try:
-            logger.info('Sending request')
-            response = requests.post(
-                endpoint, headers=headers, data=body, timeout=10)
-        # pylint: disable=broad-except
-        except Exception as err:
-            logger.error('Request failed: %s', str(err))
-            return RenderResultListAction([
-                ExtensionResultItem(icon=EXTENSION_ICON,
-                                    name='Request failed: ' + str(err),
-                                    on_enter=CopyToClipboardAction(str(err)))
-            ])
-
-        logger.info('Request succeeded')
-        logger.info('Response: %s', str(response))
-
-        # Get response
-        # Choice schema
-        #  { message: Message, finish_reason: string, index: number }
-        # Message schema
-        #  { role: string, content: string }
-        try:
-            response = response.json()
-            choices = response['choices']
-        # pylint: disable=broad-except
-        except Exception as err:
-            logger.error('Failed to parse response: %s', str(response))
-            errMsg = "Unknown error, please check logs for more info"
-            try:
-                errMsg = response['error']['message']
-            except Exception:
-                pass
-
-            return RenderResultListAction([
-                ExtensionResultItem(icon=EXTENSION_ICON,
-                                    name='Failed to parse response: ' +
-                                    errMsg,
-                                    on_enter=CopyToClipboardAction(str(errMsg)))
-            ])
-
-        items: list[ExtensionResultItem] = []
-        try:
-            for choice in choices:
-                message = choice['message']['content']
-                message = wrap_text(message, line_wrap)
-
-                items.append(ExtensionResultItem(icon=EXTENSION_ICON, name="Assistant", description=message,
-                                                 on_enter=CopyToClipboardAction(message)))
-        # pylint: disable=broad-except
-        except Exception as err:
-            logger.error('Failed to parse response: %s', str(response))
-            return RenderResultListAction([
-                ExtensionResultItem(icon=EXTENSION_ICON,
-                                    name='Failed to parse response: ' +
-                                    str(response),
-                                    on_enter=CopyToClipboardAction(str(err)))
-            ])
 
         try:
-            item_string = ' | '.join([item.description for item in items])
-            logger.info("Results: %s", item_string)
-        except Exception as err:
-            logger.error('Failed to log results: %s', str(err))
-            logger.error('Results: %s', str(items))
+            with requests.post(
+                config.api_endpoint,
+                headers=config.api_headers,
+                json=payload,
+                stream=True,
+                timeout=10,
+            ) as response:
+                response.raise_for_status()
 
-        return RenderResultListAction(items)
+                for line in response.iter_lines():
+                    if not line or line.strip() == b"data: [DONE]":
+                        continue
+                    if line.startswith(b"data: "):
+                        try:
+                            data = json.loads(line[6:])
+                            if (
+                                content := data["choices"][0]
+                                .get("delta", {})
+                                .get("content")
+                            ):
+                                yield content
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+
+        except requests.RequestException as e:
+            raise ChatGPTError(f"API request failed: {str(e)}")
+
+    def on_event(
+        self, event: KeywordQueryEvent, extension: Extension
+    ) -> RenderResultListAction:
+        query = event.get_argument()
+        if not query:
+            return RenderResultListAction(
+                [
+                    ExtensionResultItem(
+                        icon=EXTENSION_ICON,
+                        name="Type in a prompt...",
+                        description="Enter your question or prompt",
+                        on_enter=DoNothingAction(),
+                    )
+                ]
+            )
+
+        try:
+            config = ChatGPTConfig.from_preferences(extension.preferences)
+            accumulated_text = []
+
+            for chunk in self._stream_api_request(config, query):
+                accumulated_text.append(chunk)
+                if len(accumulated_text) >= CHUNK_ACCUMULATION_SIZE:
+                    break
+
+            text = "".join(accumulated_text)
+            if not text:
+                return RenderResultListAction(
+                    [
+                        ExtensionResultItem(
+                            icon=EXTENSION_ICON,
+                            name="No response received",
+                            description="Try again or check your API key",
+                            on_enter=DoNothingAction(),
+                        )
+                    ]
+                )
+
+            return RenderResultListAction([self._create_result_item(text, config)])
+
+        except ChatGPTError as e:
+            return RenderResultListAction(
+                [
+                    ExtensionResultItem(
+                        icon=EXTENSION_ICON,
+                        name=f"Error: {str(e)}",
+                        on_enter=HideWindowAction(),
+                    )
+                ]
+            )
 
 
-if __name__ == '__main__':
+class ItemEnterEventListener(EventListener):
+    """Listener for handling item enter events."""
+
+    def on_event(
+        self, event: ItemEnterEvent, extension: Extension
+    ) -> RenderResultListAction:
+        """Handle item enter event."""
+        data = event.get_data()
+        return RenderResultListAction(
+            [
+                ExtensionResultItem(
+                    icon=EXTENSION_ICON,
+                    name="Text copied to clipboard",
+                    description=(
+                        data[:MAX_DESCRIPTION_LENGTH] + "..."
+                        if len(data) > MAX_DESCRIPTION_LENGTH
+                        else data
+                    ),
+                    on_enter=HideWindowAction(),
+                )
+            ]
+        )
+
+
+class GPTExtension(Extension):
+    def __init__(self):
+        super().__init__()
+        self.subscribe(KeywordQueryEvent, KeywordQueryEventListener())
+        self.subscribe(ItemEnterEvent, ItemEnterEventListener())
+
+
+if __name__ == "__main__":
     GPTExtension().run()

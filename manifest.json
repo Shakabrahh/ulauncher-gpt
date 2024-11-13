@@ -1,11 +1,11 @@
 {
     "required_api_version": "^2.0.0",
     "name": "ChatGPT",
-    "description": "Create a domain specific assistant using GPT-3.5",
+    "description": "Create a domain specific assistant using GPT",
     "developer_name": "SeoFernando",
     "icon": "images/icon.png",
     "options": {
-        "query_debounce": 2
+        "query_debounce": 1.0
     },
     "preferences": [
         {
@@ -26,7 +26,7 @@
             "type": "input",
             "name": "OpenAI chat completion model",
             "description": "For model names see https://platform.openai.com/docs/guides/chat",
-            "default_value": "gpt-3.5-turbo"
+            "default_value": "gpt-4o-mini"
         },
         {
             "id": "line_wrap",
@@ -76,6 +76,13 @@
             "name": "Presence Penalty",
             "description": "Prevents topic repetition (0-2)",
             "default_value": "0.0"
+        },
+        {
+            "id": "api_endpoint",
+            "type": "input",
+            "name": "API Endpoint",
+            "description": "OpenAI API endpoint (or compatible alternative)",
+            "default_value": "https://api.openai.com/v1/chat/completions"
         }
     ]
 }
