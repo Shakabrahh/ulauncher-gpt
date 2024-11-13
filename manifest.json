@@ -54,7 +54,7 @@
             "type": "input",
             "name": "Max Tokens",
             "description": "Maximum number of tokens to generate (1-2048)",
-            "default_value": "42"
+            "default_value": "256"
         },
         {
             "id": "top_p",

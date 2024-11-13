@@ -17,9 +17,9 @@ from ulauncher.api.shared.item.ExtensionResultItem import ExtensionResultItem
 
 logger = logging.getLogger(__name__)
 EXTENSION_ICON = "images/icon.png"
-CHUNK_ACCUMULATION_SIZE = 50
-MAX_NAME_LENGTH = 50
-MAX_DESCRIPTION_LENGTH = 200
+CHUNK_ACCUMULATION_SIZE = 200
+MAX_NAME_LENGTH = 100
+MAX_DESCRIPTION_LENGTH = 500
 
 
 class ChatGPTError(Exception):
@@ -54,7 +54,7 @@ class ChatGPTConfig:
                         "api_endpoint", "https://api.openai.com/v1/chat/completions"
                     )
                 ),
-                max_tokens=int(preferences.get("max_tokens", 150)),
+                max_tokens=int(preferences.get("max_tokens", 256)),
                 frequency_penalty=float(preferences.get("frequency_penalty", 0.0)),
                 presence_penalty=float(preferences.get("presence_penalty", 0.0)),
                 temperature=float(preferences.get("temperature", 0.7)),
